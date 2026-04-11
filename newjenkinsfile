@@ -1,0 +1,112 @@
+pipeline {
+    agent any
+   
+    tools {
+        jdk 'jdk17'
+        nodejs 'node23'
+    }
+   
+    environment {
+        SCANNER_HOME = tool 'sonar-scanner'
+        IMAGE_NAME   = 'bertrussoff/swiggy'
+        TAG          = 'latest'
+    }
+   
+    stages {
+        stage('Clean Workspace') {
+            steps { cleanWs() }
+        }
+       
+        stage('Checkout') {
+            steps {
+                git branch: 'main', url: 'https://github.com/Bertrussoff/swiggy_deploy.git'
+            }
+        }
+       
+        stage('SonarQube Analysis') {
+            steps {
+                withSonarQubeEnv('sonar-server') {
+                    sh '''
+                        $SCANNER_HOME/bin/sonar-scanner \
+                        -Dsonar.projectName=Swiggy \
+                        -Dsonar.projectKey=Swiggy \
+                        -Dsonar.sources=.
+                    '''
+                }
+            }
+        }
+       
+        stage('Quality Gate') {
+            steps {
+                timeout(time: 10, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true, credentialsId: 'Sonar-token'
+                }
+            }
+        }
+       
+        stage('Install Dependencies') {
+            steps { sh 'npm install' }
+        }
+       
+        stage('OWASP Dependency Check') {
+            steps {
+                script {
+                    try {
+                        dependencyCheck additionalArguments: '--scan ./ --disableYarnAudit --disableNodeAudit',
+                                       odcInstallation: 'DP-Check'
+                        dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
+                    } catch (Exception e) {
+                        echo "⚠️ OWASP Dependency Check failed (NVD issue) - Continuing..."
+                        currentBuild.result = 'UNSTABLE'
+                    }
+                }
+            }
+        }
+       
+        stage('TRIVY FS Scan') {
+            steps { sh 'trivy fs . --format table -o trivyfs.txt || true' }
+        }
+       
+        stage('Docker Build & Push') {
+            steps {
+                script {
+                    docker.withRegistry('', 'docker-creds') {
+                        sh """
+                            docker build -t ${IMAGE_NAME}:${TAG} .
+                            docker push ${IMAGE_NAME}:${TAG}
+                        """
+                    }
+                }
+            }
+        }
+       
+        stage('TRIVY Image Scan') {
+            steps { sh "trivy image ${IMAGE_NAME}:${TAG} --format table -o trivy.txt || true" }
+        }
+       
+        stage('Deploy to Container') {
+            steps {
+                script {
+                    sh 'docker stop swiggy || true'
+                    sh 'docker rm swiggy || true'
+                    sh "docker run -d --name swiggy -p 3000:3000 ${IMAGE_NAME}:${TAG}"
+                }
+            }
+        }
+    }
+   
+    post {
+        always {
+            archiveArtifacts artifacts: 'trivyfs.txt, trivy.txt', allowEmptyArchive: true
+        }
+        success {
+            echo '✅ Pipeline executed successfully!'
+        }
+        unstable {
+            echo '⚠️ Pipeline completed with warnings (mainly OWASP Dependency Check)'
+        }
+        failure {
+            echo '❌ Pipeline failed'
+        }
+    }
+}
