@@ -2,7 +2,7 @@ pipeline {
     agent any
     
     tools {
-        jdk 'Temurin JDK 17'      // ← Change to the exact name you gave in Tools
+        jdk 'jdk17'      // ← Change to the exact name you gave in Tools
         nodejs 'node23'           // ← Make sure this name matches Global Tool Configuration
     }
     
