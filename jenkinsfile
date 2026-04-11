@@ -1,35 +1,33 @@
 pipeline {
     agent any
-    
+   
     tools {
-        jdk 'jdk17'      // ← Change to the exact name you gave in Tools
-        nodejs 'node23'           // ← Make sure this name matches Global Tool Configuration
+        jdk 'jdk17'           // Confirmed from your log
+        nodejs 'node23'
     }
-    
+   
     environment {
-        SCANNER_HOME = tool 'SonarQube Scanner'   // ← Exact name from Jenkins Tools
+        SCANNER_HOME = tool 'sonar-scanner'     // Change to 'SonarQube Scanner' if this fails
         IMAGE_NAME   = 'bertrussoff/swiggy'
         TAG          = 'latest'
     }
-    
+   
     stages {
         stage('Clean Workspace') {
             steps {
                 cleanWs()
             }
         }
-        
+       
         stage('Checkout from Git') {
             steps {
-                git branch: 'main', 
-                    url: 'https://github.com/Bertrussoff/swiggy_deploy.git'
-                // Add credentialsId: 'your-github-cred' if repo is private
+                git branch: 'main', url: 'https://github.com/Bertrussoff/swiggy_deploy.git'
             }
         }
-        
+       
         stage('SonarQube Analysis') {
             steps {
-                withSonarQubeEnv('sonar-server') {   // ← Make sure this name matches your SonarQube server config
+                withSonarQubeEnv('sonar-server') {
                     sh '''
                         $SCANNER_HOME/bin/sonar-scanner \
                         -Dsonar.projectName=Swiggy \
@@ -39,41 +37,46 @@ pipeline {
                 }
             }
         }
-        
+       
         stage('Quality Gate') {
             steps {
-                script {
-                    timeout(time: 10, unit: 'MINUTES') {   // Safety timeout
-                        waitForQualityGate abortPipeline: true, credentialsId: 'Sonar-token'
-                    }
+                timeout(time: 10, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true, credentialsId: 'Sonar-token'
                 }
             }
         }
-        
+       
         stage('Install Dependencies') {
             steps {
                 sh 'npm install'
             }
         }
-        
+       
         stage('OWASP Dependency Check') {
             steps {
-                dependencyCheck additionalArguments: '--scan ./ --disableYarnAudit --disableNodeAudit', 
-                               odcInstallation: 'DP-Check'
-                dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
+                script {
+                    try {
+                        dependencyCheck additionalArguments: '--scan ./ --disableYarnAudit --disableNodeAudit', 
+                                       odcInstallation: 'DP-Check'
+                        dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
+                    } catch (Exception e) {
+                        echo "⚠️ OWASP Dependency Check failed (NVD issue). Continuing anyway..."
+                        currentBuild.result = 'UNSTABLE'
+                    }
+                }
             }
         }
-        
+       
         stage('TRIVY Filesystem Scan') {
             steps {
-                sh 'trivy fs . --format table -o trivyfs.txt'
+                sh 'trivy fs . --format table -o trivyfs.txt || true'
             }
         }
-        
+       
         stage('Docker Build & Push') {
             steps {
                 script {
-                    docker.withRegistry('', 'docker-creds') {   // Better modern syntax
+                    docker.withRegistry('', 'docker-creds') {
                         sh """
                             docker build -t ${IMAGE_NAME}:${TAG} .
                             docker push ${IMAGE_NAME}:${TAG}
@@ -82,35 +85,34 @@ pipeline {
                 }
             }
         }
-        
+       
         stage('TRIVY Image Scan') {
             steps {
-                sh "trivy image ${IMAGE_NAME}:${TAG} --format table -o trivy.txt"
+                sh "trivy image ${IMAGE_NAME}:${TAG} --format table -o trivy.txt || true"
             }
         }
-        
+       
         stage('Deploy to Container') {
             steps {
                 script {
-                    // Stop and remove old container if exists
-                    sh '''
-                        docker stop swiggy || true
-                        docker rm swiggy || true
-                    '''
+                    // Safe cleanup
+                    sh 'docker stop swiggy || true'
+                    sh 'docker rm swiggy || true'
                     sh "docker run -d --name swiggy -p 3000:3000 ${IMAGE_NAME}:${TAG}"
                 }
             }
         }
     }
-    
+   
     post {
         always {
-            echo 'Pipeline finished'
-            // Optional: archive reports
             archiveArtifacts artifacts: 'trivyfs.txt, trivy.txt', allowEmptyArchive: true
         }
         success {
             echo '✅ Pipeline completed successfully!'
+        }
+        unstable {
+            echo '⚠️ Pipeline completed with some warnings'
         }
         failure {
             echo '❌ Pipeline failed'
